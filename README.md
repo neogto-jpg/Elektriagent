@@ -5,10 +5,14 @@ prices** from [Nord Pool](https://data.nordpoolgroup.com/auction/day-ahead/price
 and pushes a summary to your phone with [ntfy](https://ntfy.sh). Days with
 large price swings are sent as high-priority alerts.
 
-It runs on GitHub Actions every day at **15:05 Tallinn time** (summer and
-winter time). If prices are not published yet it retries every 10 minutes for
-up to 90 minutes. If Nord Pool is unreachable it falls back to Elering's
-public API, which republishes the same exchange prices.
+It runs on GitHub Actions once an hour from about 14:00 to 23:00 Tallinn
+time. Nord Pool publishes tomorrow's prices around 13:45 Estonian time; the
+first run after that sends the notification, and later runs see (from your
+ntfy topic) that it was already sent and do nothing. Running hourly makes it
+robust to GitHub starting scheduled jobs late, which happens often and can
+be hours. If prices are still missing at 21:00 you get a "prices not
+available" notification. If Nord Pool is unreachable it falls back to
+Elering's public API, which republishes the same exchange prices.
 
 ## What you get
 
@@ -88,6 +92,10 @@ python3 -m unittest discover -s tests -t .           # run tests
 - GitHub disables scheduled workflows in **public** repos after 60 days with
   no commits. If that happens, re-enable the workflow in the Actions tab.
   Private repos are not affected.
-- GitHub may start scheduled runs a few minutes late at busy times.
+- GitHub often starts scheduled runs late (from minutes to hours), so the
+  notification usually arrives between 14:30 and 16:30 rather than at a fixed
+  minute.
+- Each notification carries a tag like `ee-2026-11-11`; that is how later
+  runs know the day was already sent.
 - If no prices can be fetched, you get a "prices not available" notification
   and the workflow run is marked failed.

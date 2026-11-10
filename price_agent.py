@@ -29,6 +29,11 @@ NORDPOOL_URL = "https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndice
 ELERING_URL = "https://dashboard.elering.ee/api/nps/price"
 USER_AGENT = "Elektriagent/1.0 (+https://github.com/neogto-jpg/Elektriagent)"
 
+# Scheduled mode (hourly GitHub Actions runs), in Tallinn local time.
+# Nord Pool publishes tomorrow's prices around 13:45 Estonian time.
+FIRST_CHECK_HOUR = 14  # earlier runs (incl. ones GitHub delayed past midnight) do nothing
+GIVE_UP_HOUR = 21  # from this hour on, missing prices trigger a "not available" alert
+
 
 @dataclass
 class Config:
@@ -287,13 +292,51 @@ def build_message(day: date, hours: list[Hour], source: str, cfg: Config) -> dic
         "title": title,
         "message": "\n".join(lines),
         "priority": 4 if alerts else 3,
-        "tags": ["warning"] if alerts else ["zap"],
+        "tags": ["warning" if alerts else "zap", day_tag(day)],
+    }
+
+
+def not_available_message(day: date) -> dict:
+    return {
+        "title": f"EE power {day:%a %d.%m}: prices not available",
+        "message": f"Could not get day-ahead prices for {day} from Nord Pool or Elering. "
+        "Check the GitHub Actions log.",
+        "priority": 4,
+        "tags": ["x", day_tag(day)],
     }
 
 
 # --------------------------------------------------------------------------
 # Notification
 # --------------------------------------------------------------------------
+
+
+def day_tag(day: date) -> str:
+    """ntfy tag marking which delivery day a notification is about."""
+    return f"ee-{day.isoformat()}"
+
+
+def already_sent(day: date, cfg: Config) -> bool:
+    """True if the topic already has a notification for this day.
+
+    ntfy.sh keeps messages for 12 hours, which covers one afternoon of
+    hourly runs. If the check fails we assume nothing was sent: a rare
+    duplicate is better than a missed day.
+    """
+    if not cfg.ntfy_topic:
+        return False
+    query = urllib.parse.urlencode({"poll": "1", "since": "12h", "tags": day_tag(day)})
+    url = f"{cfg.ntfy_server.rstrip('/')}/{urllib.parse.quote(cfg.ntfy_topic)}/json?{query}"
+    headers = {"User-Agent": USER_AGENT}
+    if cfg.ntfy_token:
+        headers["Authorization"] = f"Bearer {cfg.ntfy_token}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as resp:
+            lines = resp.read().decode("utf-8").splitlines()
+        return any(json.loads(line).get("event") == "message" for line in lines if line.strip())
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"Could not check earlier notifications: {exc}", file=sys.stderr)
+        return False
 
 
 def send_ntfy(payload: dict, cfg: Config) -> None:
@@ -326,6 +369,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the message instead of sending it")
     parser.add_argument("--wait-minutes", type=int, default=90, help="keep retrying this long if prices are not out yet")
     parser.add_argument("--retry-interval", type=int, default=10, help="minutes between retries")
+    parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="hourly-run mode: send tomorrow's prices once per day, no waiting (used by GitHub Actions)",
+    )
     args = parser.parse_args(argv)
 
     cfg = Config.from_env()
@@ -333,28 +381,51 @@ def main(argv: list[str] | None = None) -> int:
         print("NTFY_TOPIC is not set (use --dry-run to test without sending)", file=sys.stderr)
         return 2
 
+    if args.scheduled:
+        return run_scheduled(cfg, args.dry_run)
+
     day = args.date or (datetime.now(TALLINN).date() + timedelta(days=1))
     deadline = time.monotonic() + args.wait_minutes * 60
 
     while (result := get_prices(day)) is None:
         if time.monotonic() + args.retry_interval * 60 > deadline:
-            deliver(
-                {
-                    "title": f"EE power {day:%a %d.%m}: prices not available",
-                    "message": f"Could not get day-ahead prices for {day} from Nord Pool or Elering. "
-                    "Check the GitHub Actions log.",
-                    "priority": 4,
-                    "tags": ["x"],
-                },
-                cfg,
-                args.dry_run,
-            )
+            deliver(not_available_message(day), cfg, args.dry_run)
             return 1
         print(f"Prices for {day} not ready, retrying in {args.retry_interval} min", file=sys.stderr)
         time.sleep(args.retry_interval * 60)
 
     prices, source = result
     deliver(build_message(day, to_hours(prices), source, cfg), cfg, args.dry_run)
+    return 0
+
+
+def run_scheduled(cfg: Config, dry_run: bool, now: datetime | None = None) -> int:
+    """One of several hourly runs: send tomorrow's prices once, as soon as they are out.
+
+    GitHub can start scheduled runs hours late, so each run decides from the
+    current Tallinn time what (if anything) to do instead of trusting that it
+    runs at the scheduled time.
+    """
+    now = now or datetime.now(TALLINN)
+    if now.hour < FIRST_CHECK_HOUR:
+        print(f"{now:%H:%M} Tallinn time is before {FIRST_CHECK_HOUR}:00; nothing to do.")
+        return 0
+
+    day = now.date() + timedelta(days=1)
+    if already_sent(day, cfg):
+        print(f"Notification for {day} already sent; nothing to do.")
+        return 0
+
+    if (result := get_prices(day)) is not None:
+        prices, source = result
+        deliver(build_message(day, to_hours(prices), source, cfg), cfg, dry_run)
+        return 0
+
+    if now.hour >= GIVE_UP_HOUR:
+        deliver(not_available_message(day), cfg, dry_run)
+        return 1
+
+    print(f"Prices for {day} not published yet; the next hourly run will retry.")
     return 0
 
 

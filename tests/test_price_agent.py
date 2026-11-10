@@ -129,5 +129,67 @@ class AnalysisTest(unittest.TestCase):
         self.assertFalse(cfg.show_hourly)
 
 
+class ScheduledRunTest(unittest.TestCase):
+    def run_at(self, hour, *, sent=False, prices=True, day=9, minute=0):
+        now = datetime(2026, 11, day, hour, minute, tzinfo=pa.TALLINN)
+        tomorrow = now.date() + timedelta(days=1)
+        start, _ = pa.local_day_bounds(tomorrow)
+        result = ({start + timedelta(hours=i): 80.0 for i in range(24)}, "Nord Pool") if prices else None
+        cfg = pa.Config(ntfy_topic="t")
+        with mock.patch.object(pa, "already_sent", return_value=sent) as sent_mock, \
+             mock.patch.object(pa, "get_prices", return_value=result) as get_mock, \
+             mock.patch.object(pa, "deliver") as deliver_mock:
+            code = pa.run_scheduled(cfg, dry_run=False, now=now)
+        return code, sent_mock, get_mock, deliver_mock
+
+    def test_run_delayed_past_midnight_does_nothing(self):
+        # The 2026-11-09 job started at 00:57 on the 10th and asked for the 11th.
+        code, _, get_mock, deliver_mock = self.run_at(0, minute=57, day=10)
+        self.assertEqual(code, 0)
+        get_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+
+    def test_sends_tomorrow_once_prices_are_out(self):
+        code, _, get_mock, deliver_mock = self.run_at(16)
+        self.assertEqual(code, 0)
+        get_mock.assert_called_once_with(date(2026, 11, 10))
+        payload = deliver_mock.call_args.args[0]
+        self.assertIn("ee-2026-11-10", payload["tags"])
+
+    def test_skips_when_already_sent(self):
+        code, _, get_mock, deliver_mock = self.run_at(17, sent=True)
+        self.assertEqual(code, 0)
+        get_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+
+    def test_waits_quietly_for_next_run(self):
+        code, _, _, deliver_mock = self.run_at(15, prices=False)
+        self.assertEqual(code, 0)
+        deliver_mock.assert_not_called()
+
+    def test_gives_up_in_the_evening(self):
+        code, _, _, deliver_mock = self.run_at(21, prices=False)
+        self.assertEqual(code, 1)
+        payload = deliver_mock.call_args.args[0]
+        self.assertIn("not available", payload["title"])
+        self.assertIn("ee-2026-11-10", payload["tags"])
+
+    def test_already_sent_reads_ntfy_cache(self):
+        cfg = pa.Config(ntfy_topic="my-topic")
+        body = b'{"id":"a","event":"open"}\n{"id":"b","event":"message","tags":["ee-2026-11-10"]}\n'
+        fake = mock.MagicMock()
+        fake.__enter__.return_value.read.return_value = body
+        with mock.patch.object(pa.urllib.request, "urlopen", return_value=fake) as urlopen:
+            self.assertTrue(pa.already_sent(date(2026, 11, 10), cfg))
+        url = urlopen.call_args.args[0].full_url
+        self.assertIn("/my-topic/json?", url)
+        self.assertIn("tags=ee-2026-11-10", url)
+
+    def test_already_sent_false_on_error(self):
+        cfg = pa.Config(ntfy_topic="my-topic")
+        with mock.patch.object(pa.urllib.request, "urlopen", side_effect=pa.urllib.error.URLError("down")):
+            self.assertFalse(pa.already_sent(date(2026, 11, 10), cfg))
+
+
 if __name__ == "__main__":
     unittest.main()
